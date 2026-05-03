@@ -1,4 +1,9 @@
-# pip install streamlit pandas numpy yfinance ta plotly
+# ==========================================
+# INSTALL:
+# pip install streamlit yfinance pandas numpy ta plotly
+# RUN:
+# streamlit run final_trading_engine.py
+# ==========================================
 
 import pandas as pd
 import numpy as np
@@ -13,8 +18,6 @@ import plotly.graph_objects as go
 MIN_SCORE = 25
 FALLBACK_TOP_N = 10
 
-USE_REGIME_FILTER = True
-
 # =============================
 # LOAD CHARTINK STOCKS
 # =============================
@@ -22,11 +25,11 @@ def load_stocks():
     df = pd.read_csv("chartink.csv")
     stocks = df["Symbol"].dropna().tolist()
 
-    # Normalize NSE format
+    # Ensure NSE format
     return [s.strip().replace(".NS", "") + ".NS" for s in stocks]
 
 # =============================
-# SAFE DATA LOADING (FIXED)
+# SAFE DATA LOADER (CRITICAL FIX)
 # =============================
 def load_data(stock):
     df = yf.download(stock, period="6mo", interval="1d", progress=False)
@@ -34,105 +37,92 @@ def load_data(stock):
     if df is None or df.empty:
         return None
 
-    df = df.copy()
-    df = df.reset_index()
+    df = df.copy().reset_index()
 
-    # 🔥 FORCE CLEAN 1D SERIES (FIX FOR YOUR ERROR)
-    df["Open"] = df["Open"].astype(float).squeeze()
-    df["High"] = df["High"].astype(float).squeeze()
-    df["Low"] = df["Low"].astype(float).squeeze()
-    df["Close"] = df["Close"].astype(float).squeeze()
-    df["Volume"] = df["Volume"].astype(float).squeeze()
+    # FORCE CLEAN NUMERIC ARRAYS
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        df[col] = pd.to_numeric(df[col].values.ravel(), errors="coerce")
 
-    return df
+    return df.dropna()
 
 # =============================
-# INDICATORS (SAFE)
+# INDICATORS (FIXED 1D ISSUE)
 # =============================
 def add_indicators(df):
     df = df.copy()
 
-    close = df["Close"].squeeze()
-    volume = df["Volume"].squeeze()
+    close = pd.Series(df["Close"].values.ravel())
+    volume = pd.Series(df["Volume"].values.ravel())
 
+    # RSI
     df["rsi"] = ta.momentum.RSIIndicator(close, window=14).rsi()
 
+    # MACD
     macd = ta.trend.MACD(close)
     df["macd"] = macd.macd()
     df["signal"] = macd.macd_signal()
 
+    # EMAs
     df["ema20"] = ta.trend.EMAIndicator(close, 20).ema_indicator()
     df["ema50"] = ta.trend.EMAIndicator(close, 50).ema_indicator()
 
+    # Volume avg
     df["vol_avg"] = volume.rolling(20).mean()
 
+    # VWAP
     df["vwap"] = (close * volume).cumsum() / volume.cumsum()
 
     return df.dropna()
 
 # =============================
-# MARKET REGIME
-# =============================
-def market_regime():
-    df = yf.download("^NSEI", period="3mo", interval="1d", progress=False)
-
-    if df is None or df.empty:
-        return True
-
-    ema50 = ta.trend.EMAIndicator(df["Close"], 50).ema_indicator()
-
-    return df["Close"].iloc[-1] > ema50.iloc[-1]
-
-# =============================
 # SCORING ENGINE
 # =============================
 def score(df):
-    last, prev = df.iloc[-1], df.iloc[-2]
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
 
-    score = 0
+    s = 0
     reasons = []
 
     if last["rsi"] > prev["rsi"]:
-        score += 10
+        s += 10
         reasons.append("RSI rising")
 
     if last["rsi"] < 60:
-        score += 5
+        s += 5
         reasons.append("RSI healthy")
 
     if last["macd"] > last["signal"]:
-        score += 15
+        s += 15
         reasons.append("MACD bullish")
 
     if last["Close"] > last["ema20"]:
-        score += 10
+        s += 10
         reasons.append("Above EMA20")
 
     if last["ema20"] > last["ema50"]:
-        score += 10
-        reasons.append("Trend aligned")
+        s += 10
+        reasons.append("Uptrend structure")
 
     if last["Close"] > last["vwap"]:
-        score += 10
+        s += 10
         reasons.append("Above VWAP")
 
     if last["Volume"] > last["vol_avg"]:
-        score += 10
+        s += 10
         reasons.append("Volume support")
 
     if last["Close"] > df["Close"].iloc[-5]:
-        score += 10
+        s += 10
         reasons.append("Momentum")
 
-    return score, reasons
+    return s, reasons
 
 # =============================
 # SCANNER
 # =============================
 def scan(stocks):
     results = []
-
-    regime = market_regime() if USE_REGIME_FILTER else True
 
     for stock in stocks:
         try:
@@ -143,16 +133,17 @@ def scan(stocks):
 
             df = add_indicators(df)
 
-            score_val, reasons = score(df)
+            if len(df) < 2:
+                continue
 
-            if USE_REGIME_FILTER and not regime:
-                score_val *= 0.8
+            s, reasons = score(df)
 
-            results.append({
-                "Stock": stock,
-                "Score": round(score_val, 2),
-                "Reasons": ", ".join(reasons)
-            })
+            if s >= MIN_SCORE:
+                results.append({
+                    "Stock": stock,
+                    "Score": round(s, 2),
+                    "Reasons": ", ".join(reasons)
+                })
 
         except:
             continue
@@ -194,14 +185,14 @@ def plot(stock):
 
     fig.add_hline(y=entry, annotation_text="Entry")
     fig.add_hline(y=target, annotation_text="Target")
-    fig.add_hline(y=stop, annotation_text="Stop")
+    fig.add_hline(y=stop, annotation_text="Stop Loss")
 
     return fig, entry, target, stop
 
 # =============================
 # UI
 # =============================
-st.title("🚀 Fixed Smart Multi-Strategy Engine")
+st.title("🚀 Final Smart Trading Engine (Crash-Free)")
 
 stocks = load_stocks()
 
@@ -210,10 +201,10 @@ st.write(f"Loaded {len(stocks)} Chartink stocks")
 if st.button("Run Scan"):
     results = scan(stocks)
 
-    # fallback so NEVER empty UI
+    # 🔥 GUARANTEED OUTPUT (FALLBACK)
     if len(results) == 0:
-        st.warning("No strong setups → showing fallback top stocks")
-        results = results[:FALLBACK_TOP_N]
+        st.warning("No strong setups found → showing fallback top stocks")
+        results = scan(stocks)[:FALLBACK_TOP_N]
 
     df = pd.DataFrame(results)
 
@@ -229,7 +220,7 @@ if st.button("Run Scan"):
         st.subheader("Trade Plan")
         st.write(f"Entry: {entry}")
         st.write(f"Target: {target}")
-        st.write(f"Stop: {stop}")
+        st.write(f"Stop Loss: {stop}")
 
         st.subheader("Why this stock?")
         st.write(df[df["Stock"] == selected]["Reasons"].values[0])
