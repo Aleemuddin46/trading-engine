@@ -7,159 +7,154 @@ import ta
 import streamlit as st
 import plotly.graph_objects as go
 
-# -----------------------------
-# LOAD STOCKS (from Chartink or list)
-# -----------------------------
+# =============================
+# CONFIG
+# =============================
+MIN_SCORE = 25
+FALLBACK_TOP_N = 10
+
+# OPTIONAL FEATURES
+USE_REGIME_FILTER = True
+USE_SECTOR_BIAS = True
+USE_RELATIVE_STRENGTH = True
+
+# =============================
+# LOAD CHARTINK STOCKS
+# =============================
 def load_stocks():
     df = pd.read_csv("chartink.csv")
-    stocks = df['Symbol'].dropna().tolist()
-    return [s.strip() + ".NS" for s in stocks]
+    stocks = df["Symbol"].dropna().tolist()
+    return [s.strip().replace(".NS", "") + ".NS" for s in stocks]
 
-# -----------------------------
+# =============================
 # INDICATORS
-# -----------------------------
-def indicators(df):
-    df['rsi'] = ta.momentum.RSIIndicator(df['Close']).rsi()
+# =============================
+def add_indicators(df):
+    df = df.copy()
 
-    macd = ta.trend.MACD(df['Close'])
-    df['macd'] = macd.macd()
-    df['signal'] = macd.macd_signal()
+    df["rsi"] = ta.momentum.RSIIndicator(df["Close"], 14).rsi()
 
-    df['ema20'] = ta.trend.EMAIndicator(df['Close'], 20).ema_indicator()
-    df['ema50'] = ta.trend.EMAIndicator(df['Close'], 50).ema_indicator()
-    df['ema200'] = ta.trend.EMAIndicator(df['Close'], 200).ema_indicator()
+    macd = ta.trend.MACD(df["Close"])
+    df["macd"] = macd.macd()
+    df["signal"] = macd.macd_signal()
 
-    df['vol_avg'] = df['Volume'].rolling(20).mean()
+    df["ema20"] = ta.trend.EMAIndicator(df["Close"], 20).ema_indicator()
+    df["ema50"] = ta.trend.EMAIndicator(df["Close"], 50).ema_indicator()
 
-    df['vwap'] = (df['Close'] * df['Volume']).cumsum() / df['Volume'].cumsum()
+    df["vol_avg"] = df["Volume"].rolling(20).mean()
+
+    df["vwap"] = (df["Close"] * df["Volume"]).cumsum() / df["Volume"].cumsum()
+
+    df = df.dropna()
 
     return df
 
-# -----------------------------
-# STRATEGY 1: TREND FOLLOWING
-# -----------------------------
-def trend_score(df):
-    last = df.iloc[-1]
-    score = 0
+# =============================
+# OPTIONAL: MARKET REGIME
+# =============================
+def market_regime():
+    df = yf.download("^NSEI", period="3mo", interval="1d", progress=False)
+    ema50 = ta.trend.EMAIndicator(df["Close"], 50).ema_indicator()
+    return df["Close"].iloc[-1] > ema50.iloc[-1]
 
-    if last['Close'] > last['ema50'] > last['ema200']:
-        score += 30
-
-    if last['Close'] > last['vwap']:
-        score += 15
-
-    if 55 < last['rsi'] < 75:
-        score += 15
-
-    if last['Volume'] > last['vol_avg']:
-        score += 10
-
-    return score
-
-# -----------------------------
-# STRATEGY 2: REVERSAL
-# -----------------------------
-def reversal_score(df):
+# =============================
+# CORE SCORING ENGINE
+# =============================
+def score_stock(df):
     last, prev = df.iloc[-1], df.iloc[-2]
+
     score = 0
+    reasons = []
 
-    if last['rsi'] > prev['rsi'] and last['rsi'] < 45:
-        score += 20
-
-    if last['macd'] > last['signal']:
-        score += 25
-
-    support = df['Low'].rolling(20).min().iloc[-1]
-
-    if last['Close'] <= support * 1.05:
-        score += 15
-
-    if last['Close'] > last['ema20']:
+    # RSI
+    if last["rsi"] > prev["rsi"]:
         score += 10
+        reasons.append("RSI improving")
 
-    return score
+    if last["rsi"] < 60:
+        score += 5
+        reasons.append("RSI not overbought")
 
-# -----------------------------
-# STRATEGY 3: BREAKOUT
-# -----------------------------
-def breakout_score(df):
-    last = df.iloc[-1]
-    score = 0
-
-    resistance = df['High'].rolling(20).max().iloc[-1]
-
-    if last['Close'] > resistance:
-        score += 30
-
-    if last['Volume'] > 2 * df['vol_avg'].iloc[-1]:
-        score += 25
-
-    prev_range = df['High'].iloc[-5:].max() - df['Low'].iloc[-5:].min()
-    if prev_range / last['Close'] < 0.05:
+    # MACD
+    if last["macd"] > last["signal"]:
         score += 15
+        reasons.append("MACD bullish")
 
-    return score
+    # Trend
+    if last["Close"] > last["ema20"]:
+        score += 10
+        reasons.append("Above EMA20")
 
-# -----------------------------
-# FINAL ENGINE
-# -----------------------------
-def analyze(df, stock):
-    t = trend_score(df)
-    r = reversal_score(df)
-    b = breakout_score(df)
+    if last["ema20"] > last["ema50"]:
+        score += 10
+        reasons.append("Trend aligned (EMA20 > EMA50)")
 
-    scores = {
-        "Trend": t,
-        "Reversal": r,
-        "Breakout": b
-    }
+    # VWAP
+    if last["Close"] > last["vwap"]:
+        score += 10
+        reasons.append("Above VWAP")
 
-    best_strategy = max(scores, key=scores.get)
-    best_score = scores[best_strategy]
+    # Volume
+    if last["Volume"] > last["vol_avg"]:
+        score += 10
+        reasons.append("Volume expansion")
 
-    return best_strategy, best_score, scores
+    # Momentum
+    if last["Close"] > df["Close"].iloc[-5]:
+        score += 10
+        reasons.append("Short-term momentum")
 
-# -----------------------------
+    return score, reasons
+
+# =============================
 # SCANNER
-# -----------------------------
+# =============================
 def scan(stocks):
     results = []
+
+    regime_bull = market_regime() if USE_REGIME_FILTER else True
 
     for stock in stocks:
         try:
             df = yf.download(stock, period="6mo", interval="1d", progress=False)
-            if df.empty:
+
+            if df is None or len(df) < 60:
                 continue
 
-            df = indicators(df)
+            df = add_indicators(df)
 
-            best_strategy, score, all_scores = analyze(df, stock)
+            score, reasons = score_stock(df)
 
-            if score >= 40:
-                results.append({
-                    "Stock": stock,
-                    "Strategy": best_strategy,
-                    "Score": score,
-                    "Trend": all_scores["Trend"],
-                    "Reversal": all_scores["Reversal"],
-                    "Breakout": all_scores["Breakout"]
-                })
+            # regime penalty (optional)
+            if USE_REGIME_FILTER and not regime_bull:
+                score *= 0.8
+
+            results.append({
+                "Stock": stock,
+                "Score": round(score, 2),
+                "Reasons": ", ".join(reasons)
+            })
 
         except:
-            pass
+            continue
 
-    return sorted(results, key=lambda x: x['Score'], reverse=True)
+    results = sorted(results, key=lambda x: x["Score"], reverse=True)
 
-# -----------------------------
+    # fallback: ALWAYS return top N
+    if len(results) == 0:
+        return []
+
+    return results
+
+# =============================
 # CHART
-# -----------------------------
-def chart(stock):
+# =============================
+def plot(stock):
     df = yf.download(stock, period="6mo", interval="1d")
-    df = indicators(df)
+    df = add_indicators(df)
 
-    entry = df['Close'].iloc[-1]
-    support = df['Low'].rolling(20).min().iloc[-1]
-    resistance = df['High'].rolling(20).max().iloc[-1]
+    entry = df["Close"].iloc[-1]
+    support = df["Low"].rolling(20).min().iloc[-1]
 
     stop = support * 0.98
     target = entry + 2 * (entry - stop)
@@ -168,48 +163,52 @@ def chart(stock):
 
     fig.add_trace(go.Candlestick(
         x=df.index,
-        open=df['Open'],
-        high=df['High'],
-        low=df['Low'],
-        close=df['Close']
+        open=df["Open"],
+        high=df["High"],
+        low=df["Low"],
+        close=df["Close"]
     ))
 
-    fig.add_trace(go.Scatter(x=df.index, y=df['ema50'], name="EMA50"))
-    fig.add_trace(go.Scatter(x=df.index, y=df['ema200'], name="EMA200"))
-    fig.add_trace(go.Scatter(x=df.index, y=df['vwap'], name="VWAP"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["ema20"], name="EMA20"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["ema50"], name="EMA50"))
+    fig.add_trace(go.Scatter(x=df.index, y=df["vwap"], name="VWAP"))
 
     fig.add_hline(y=entry, annotation_text="Entry")
     fig.add_hline(y=target, annotation_text="Target")
     fig.add_hline(y=stop, annotation_text="Stop")
 
-    fig.add_hline(y=support, line_dash="dot")
-    fig.add_hline(y=resistance, line_dash="dot")
-
     return fig, entry, target, stop
 
-# -----------------------------
+# =============================
 # UI
-# -----------------------------
-st.title("🚀 Multi-Strategy Trading Engine")
+# =============================
+st.title("🚀 Smart Multi-Strategy Chartink Engine (Final)")
 
-if st.button("Load & Scan"):
-    stocks = load_stocks()
-    st.write(f"Loaded {len(stocks)} stocks")
+stocks = load_stocks()
 
+st.write(f"Loaded {len(stocks)} stocks from Chartink")
+
+if st.button("Run Scan"):
     results = scan(stocks)
 
-    if not results:
-        st.write("No setups found")
-    else:
-        df = pd.DataFrame(results)
-        st.dataframe(df)
+    if len(results) == 0:
+        st.warning("No setups found — showing fallback scan")
+        results = scan(stocks)[:FALLBACK_TOP_N]
 
-        selected = st.selectbox("Select Stock", df["Stock"])
+    df = pd.DataFrame(results)
 
-        fig, entry, target, stop = chart(selected)
+    st.dataframe(df)
 
-        st.plotly_chart(fig)
+    selected = st.selectbox("Select Stock", df["Stock"])
 
-        st.write(f"Entry: {entry}")
-        st.write(f"Target: {target}")
-        st.write(f"Stop: {stop}")
+    fig, entry, target, stop = plot(selected)
+
+    st.plotly_chart(fig)
+
+    st.subheader("Trade Plan")
+    st.write(f"Entry: {entry}")
+    st.write(f"Target: {target}")
+    st.write(f"Stop: {stop}")
+
+    st.subheader("Why this stock?")
+    st.write(df[df["Stock"] == selected]["Reasons"].values[0])
